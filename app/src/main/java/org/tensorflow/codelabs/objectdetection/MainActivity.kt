@@ -1,269 +1,242 @@
 package org.tensorflow.codelabs.objectdetection
 
-import android.app.Activity
-import android.content.ActivityNotFoundException
-import android.content.Intent
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.pm.PackageManager
 import android.graphics.*
-import android.net.Uri
 import android.os.Bundle
-import android.os.Environment
-import android.provider.MediaStore
 import android.util.Log
 import android.view.View
 import android.widget.Button
-import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.FileProvider
-import androidx.exifinterface.media.ExifInterface
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.common.FileUtil
-import java.io.File
-import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.text.SimpleDateFormat
-import java.util.*
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.min
 
-class MainActivity : AppCompatActivity(), View.OnClickListener {
+/**
+ * Real-time Currency Detection with CameraX
+ * Detects Indian currency notes in real-time using the camera
+ */
+class MainActivity : AppCompatActivity() {
     companion object {
-        const val TAG = "TFLite - ODT"
-        const val REQUEST_IMAGE_CAPTURE: Int = 1
-        private const val MAX_FONT_SIZE = 96F
-        private const val INPUT_SIZE = 320  // Model expects 320x320, not 640x640!
+        const val TAG = "CurrencyDetector"
+        private const val REQUEST_CODE_PERMISSIONS = 10
+        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+        private const val INPUT_SIZE = 320
         private const val NUM_CLASSES = 6
-        private const val CONFIDENCE_THRESHOLD = 0.25f
+        private const val CONFIDENCE_THRESHOLD = 0.5f
         private const val IOU_THRESHOLD = 0.45f
     }
 
-    private lateinit var captureImageFab: Button
-    private lateinit var inputImageView: ImageView
-    private lateinit var imgSampleOne: ImageView
-    private lateinit var imgSampleTwo: ImageView
-    private lateinit var imgSampleThree: ImageView
-    private lateinit var tvPlaceholder: TextView
-    private lateinit var currentPhotoPath: String
+    // UI Components
+    private lateinit var previewView: PreviewView
+    private lateinit var overlayView: OverlayView
+    private lateinit var btnToggleCamera: Button
+    private lateinit var tvStatus: TextView
 
+    // Camera
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var cameraExecutor: ExecutorService? = null
+    private var imageAnalysis: ImageAnalysis? = null
+    private var isCameraRunning = false
+
+    // Model
     private var interpreter: Interpreter? = null
     private val labels = listOf("10", "100", "20", "200", "50", "500")
 
+    // Detection state
+    private var lastDetectionTime = 0L
+    private val detectionInterval = 100L // Run detection every 100ms
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        setContentView(R.layout.activity_camera)
 
-        captureImageFab = findViewById(R.id.captureImageFab)
-        inputImageView = findViewById(R.id.imageView)
-        imgSampleOne = findViewById(R.id.imgSampleOne)
-        imgSampleTwo = findViewById(R.id.imgSampleTwo)
-        imgSampleThree = findViewById(R.id.imgSampleThree)
-        tvPlaceholder = findViewById(R.id.tvPlaceholder)
+        // Initialize UI
+        previewView = findViewById(R.id.previewView)
+        overlayView = findViewById(R.id.overlayView)
+        btnToggleCamera = findViewById(R.id.btnToggleCamera)
+        tvStatus = findViewById(R.id.tvStatus)
 
-        captureImageFab.setOnClickListener(this)
-        imgSampleOne.setOnClickListener(this)
-        imgSampleTwo.setOnClickListener(this)
-        imgSampleThree.setOnClickListener(this)
+        btnToggleCamera.setOnClickListener {
+            if (isCameraRunning) {
+                stopCamera()
+            } else {
+                startCamera()
+            }
+        }
+
+        // Initialize camera executor
+        cameraExecutor = Executors.newSingleThreadExecutor()
 
         // Load model
         try {
-            val modelFile = FileUtil.loadMappedFile(this, "best22_2_26_float32.tflite")
-            val options = Interpreter.Options()
-            options.setNumThreads(4)
+            val modelFile = FileUtil.loadMappedFile(this, "currency_model.tflite")
+            val options = Interpreter.Options().apply {
+                setNumThreads(4)
+            }
             interpreter = Interpreter(modelFile, options)
-            Log.d(TAG, "Model loaded successfully")
+            Log.d(TAG, "✅ Model loaded successfully")
+            tvStatus.text = "Model loaded. Tap Start to begin detection."
         } catch (e: Exception) {
-            Log.e(TAG, "Error loading model", e)
+            Log.e(TAG, "❌ Error loading model", e)
+            tvStatus.text = "Error loading model"
             Toast.makeText(this, "Failed to load model", Toast.LENGTH_LONG).show()
         }
-    }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        interpreter?.close()
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQUEST_IMAGE_CAPTURE && resultCode == Activity.RESULT_OK) {
-            setViewAndDetect(getCapturedImage())
+        // Request camera permissions
+        if (allPermissionsGranted()) {
+            tvStatus.text = "Ready. Tap Start Camera."
+        } else {
+            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
     }
 
-    override fun onClick(v: View?) {
-        when (v?.id) {
-            R.id.captureImageFab -> {
-                try {
-                    dispatchTakePictureIntent()
-                } catch (e: ActivityNotFoundException) {
-                    Log.e(TAG, e.message.toString())
-                    Toast.makeText(this, "No camera app found", Toast.LENGTH_SHORT).show()
+    private fun startCamera() {
+        if (!allPermissionsGranted()) {
+            Toast.makeText(this, "Camera permission required", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            cameraProvider = cameraProviderFuture.get()
+            bindCameraUseCases()
+            isCameraRunning = true
+            btnToggleCamera.text = "Stop Camera"
+            tvStatus.text = "Detecting..."
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun stopCamera() {
+        cameraProvider?.unbindAll()
+        isCameraRunning = false
+        btnToggleCamera.text = "Start Camera"
+        tvStatus.text = "Camera stopped"
+        overlayView.clear()
+    }
+
+    @SuppressLint("UnsafeOptInUsageError")
+    private fun bindCameraUseCases() {
+        val cameraProvider = cameraProvider ?: return
+
+        // Preview use case
+        val preview = Preview.Builder()
+            .build()
+            .also {
+                it.setSurfaceProvider(previewView.surfaceProvider)
+            }
+
+        // Image analysis use case
+        imageAnalysis = ImageAnalysis.Builder()
+            .setTargetResolution(android.util.Size(640, 480))
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
+            .also {
+                it.setAnalyzer(cameraExecutor!!) { imageProxy ->
+                    processImage(imageProxy)
                 }
             }
-            R.id.imgSampleOne -> {
-                setViewAndDetect(getSampleImage(R.drawable.img_meal_one))
-            }
-            R.id.imgSampleTwo -> {
-                setViewAndDetect(getSampleImage(R.drawable.img_meal_two))
-            }
-            R.id.imgSampleThree -> {
-                setViewAndDetect(getSampleImage(R.drawable.img_meal_three))
-            }
-        }
-    }
 
-    private fun runObjectDetection(bitmap: Bitmap) {
+        // Select back camera
+        val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
         try {
-            Log.d(TAG, "=== Starting Currency Detection ===")
-            if (interpreter == null) {
-                Log.e(TAG, "Interpreter not initialized")
-                return
-            }
+            cameraProvider.unbindAll()
+            cameraProvider.bindToLifecycle(
+                this,
+                cameraSelector,
+                preview,
+                imageAnalysis
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Camera binding failed", e)
+        }
+    }
 
-            // Log model details
-            val inputTensor = interpreter!!.getInputTensor(0)
-            val outputTensor = interpreter!!.getOutputTensor(0)
-            Log.d(TAG, "Input tensor: shape=${inputTensor.shape().contentToString()}, dtype=${inputTensor.dataType()}")
-            Log.d(TAG, "Output tensor: shape=${outputTensor.shape().contentToString()}, dtype=${outputTensor.dataType()}")
+    @SuppressLint("UnsafeOptInUsageError")
+    private fun processImage(imageProxy: ImageProxy) {
+        // Throttle detection to avoid overwhelming the system
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastDetectionTime < detectionInterval) {
+            imageProxy.close()
+            return
+        }
+        lastDetectionTime = currentTime
 
-            val resizedBitmap = Bitmap.createScaledBitmap(bitmap, INPUT_SIZE, INPUT_SIZE, true)
-            val inputBuffer = preprocessImage(resizedBitmap)
+        try {
+            val bitmap = imageProxy.toBitmap()
+            val rotatedBitmap = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
 
-            // Verify buffer size
-            val expectedBytes = inputTensor.numBytes()
-            Log.d(TAG, "Buffer size: expected=$expectedBytes, actual=${inputBuffer.capacity()}")
-            if (inputBuffer.capacity() != expectedBytes) {
-                Log.e(TAG, "Buffer size mismatch!")
-                return
-            }
+            // Run detection
+            val detections = detectObjects(rotatedBitmap)
 
-            // Log some input values
-            inputBuffer.rewind()
-            val sampleBytes = ByteArray(30)
-            inputBuffer.get(sampleBytes)
-            inputBuffer.rewind()
-            Log.d(TAG, "First 30 input bytes: ${sampleBytes.take(30).joinToString(",") { (it.toInt() and 0xFF).toString() }}")
-
-            // Output buffer
-            val output = Array(1) { Array(10) { FloatArray(2100) } }
-
-            Log.d(TAG, "Running inference...")
-            interpreter!!.run(inputBuffer, output)
-            Log.d(TAG, "Inference complete")
-
-            // Analyze output in detail
-            val outputArray = output[0]
-
-            // Check if output is all zeros
-            var hasNonZero = false
-            var sumValues = 0.0
-            var countNonZero = 0
-
-            for (i in 0 until 2100) {
-                for (c in 0 until 10) {
-                    val v = outputArray[c][i]
-                    sumValues += Math.abs(v.toDouble())
-                    if (v != 0f) {
-                        hasNonZero = true
-                        countNonZero++
-                    }
-                }
-            }
-
-            Log.d(TAG, "Output analysis: hasNonZero=$hasNonZero, countNonZero=$countNonZero, sumAbs=$sumValues")
-
-            // Log a few sample outputs
-            Log.d(TAG, "Sample outputs at indices 0, 100, 500:")
-            for (idx in listOf(0, 100, 500)) {
-                Log.d(TAG, "  [$idx]: x=${outputArray[0][idx]}, y=${outputArray[1][idx]}, w=${outputArray[2][idx]}, h=${outputArray[3][idx]}")
-                Log.d(TAG, "       classes: ${(4 until 10).map { outputArray[it][idx] }.joinToString(",")}")
-            }
-
-            // Find max value
-            var maxVal = -Float.MAX_VALUE
-            var maxIdx = -1
-            var maxChannel = -1
-            for (i in 0 until 2100) {
-                for (c in 0 until 10) {
-                    val v = outputArray[c][i]
-                    if (v > maxVal) {
-                        maxVal = v
-                        maxIdx = i
-                        maxChannel = c
-                    }
-                }
-            }
-            Log.d(TAG, "Max output: value=$maxVal at index=$maxIdx, channel=$maxChannel")
-
-            if (maxIdx != -1) {
-                Log.d(TAG, "Sample at max index $maxIdx:")
-                Log.d(TAG, "  x=${outputArray[0][maxIdx]}, y=${outputArray[1][maxIdx]}, w=${outputArray[2][maxIdx]}, h=${outputArray[3][maxIdx]}")
-                for (c in 0 until NUM_CLASSES) {
-                    Log.d(TAG, "  class ${labels[c]}: ${outputArray[4+c][maxIdx]}")
-                }
-            }
-
-            // Parse output (same as before)
-            val detections = parseOutput(output[0], bitmap.width, bitmap.height)
-
-            Log.d(TAG, "After NMS: ${detections.size} detections")
-
-            // Convert to display format
-            val resultToDisplay = detections.map { detection ->
-                val text = String.format("₹%s (%.0f%%)",
-                    detection.label,
-                    detection.confidence * 100)
-                DetectionResult(detection.bbox, text)
-            }
-
-            // Draw results
-            val imgWithResult = drawDetectionResult(bitmap, resultToDisplay)
-
+            // Update overlay on UI thread
             runOnUiThread {
-                inputImageView.setImageBitmap(imgWithResult)
-                tvPlaceholder.visibility = View.INVISIBLE
+                overlayView.setDetections(detections, rotatedBitmap.width, rotatedBitmap.height)
 
-                if (detections.isEmpty()) {
-                    Toast.makeText(this, "No currency detected", Toast.LENGTH_SHORT).show()
+                if (detections.isNotEmpty()) {
+                    val total = detections.sumOf { it.label.toIntOrNull() ?: 0 }
+                    tvStatus.text = "Detected: ${detections.size} note(s), Total: ₹$total"
                 } else {
-                    val totalValue = detections.sumOf { it.label.toIntOrNull() ?: 0 }
-                    Toast.makeText(
-                        this,
-                        "Found ${detections.size} note(s), Total: ₹$totalValue",
-                        Toast.LENGTH_LONG
-                    ).show()
+                    tvStatus.text = "No currency detected"
                 }
             }
+
         } catch (e: Exception) {
             Log.e(TAG, "Detection error", e)
-            e.printStackTrace()
-            runOnUiThread {
-                Toast.makeText(this, "Error: ${e.message}", Toast.LENGTH_LONG).show()
-            }
+        } finally {
+            imageProxy.close()
+        }
+    }
+
+    private fun detectObjects(bitmap: Bitmap): List<Detection> {
+        if (interpreter == null) return emptyList()
+
+        try {
+            // Resize and preprocess
+            val resizedBitmap = Bitmap.createScaledBitmap(bitmap, INPUT_SIZE, INPUT_SIZE, false)
+            val inputBuffer = preprocessImage(resizedBitmap)
+
+            // Run inference
+            val output = Array(1) { Array(10) { FloatArray(2100) } }
+            interpreter!!.run(inputBuffer, output)
+
+            // Parse and return detections
+            return parseOutput(output[0], bitmap.width, bitmap.height)
+        } catch (e: Exception) {
+            Log.e(TAG, "Detection failed", e)
+            return emptyList()
         }
     }
 
     private fun preprocessImage(bitmap: Bitmap): ByteBuffer {
-        // Model expects FLOAT32 input [1, 320, 320, 3] in RGB order
         val inputBuffer = ByteBuffer.allocateDirect(4 * INPUT_SIZE * INPUT_SIZE * 3)
         inputBuffer.order(ByteOrder.nativeOrder())
 
         val intValues = IntArray(INPUT_SIZE * INPUT_SIZE)
         bitmap.getPixels(intValues, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
 
-        // Android Bitmap.getPixels() returns ARGB in an int
-        // We need RGB in float32 normalized to [0, 1]
         for (pixel in intValues) {
-            // Extract RGB channels from ARGB int
             val r = ((pixel shr 16) and 0xFF) / 255.0f
             val g = ((pixel shr 8) and 0xFF) / 255.0f
             val b = (pixel and 0xFF) / 255.0f
 
-            // Put in RGB order (not BGR!)
             inputBuffer.putFloat(r)
             inputBuffer.putFloat(g)
             inputBuffer.putFloat(b)
@@ -272,22 +245,16 @@ class MainActivity : AppCompatActivity(), View.OnClickListener {
         return inputBuffer
     }
 
-    private fun parseOutput(
-        output: Array<FloatArray>,
-        originalWidth: Int,
-        originalHeight: Int
-    ): List<Detection> {
+    private fun parseOutput(output: Array<FloatArray>, imageWidth: Int, imageHeight: Int): List<Detection> {
         val detections = mutableListOf<Detection>()
-        val numBoxes = output[0].size // 2100
+        val numBoxes = output[0].size
 
         for (i in 0 until numBoxes) {
-            // Coordinates (first 4 rows)
             val xCenter = output[0][i]
             val yCenter = output[1][i]
             val width = output[2][i]
             val height = output[3][i]
 
-            // Find best class
             var bestScore = 0f
             var bestClass = 0
             for (c in 0 until NUM_CLASSES) {
@@ -299,22 +266,13 @@ class MainActivity : AppCompatActivity(), View.OnClickListener {
             }
 
             if (bestScore >= CONFIDENCE_THRESHOLD) {
-                // YOLO outputs are normalized to [0, 1] range
-                // Need to multiply by original image dimensions
-                val left = (xCenter - width / 2) * originalWidth
-                val top = (yCenter - height / 2) * originalHeight
-                val right = (xCenter + width / 2) * originalWidth
-                val bottom = (yCenter + height / 2) * originalHeight
+                // YOLO coordinates are normalized [0, 1]
+                val left = (xCenter - width / 2) * imageWidth
+                val top = (yCenter - height / 2) * imageHeight
+                val right = (xCenter + width / 2) * imageWidth
+                val bottom = (yCenter + height / 2) * imageHeight
 
                 val bbox = RectF(left, top, right, bottom)
-
-                // Debug first detection
-                if (detections.isEmpty()) {
-                    Log.d(TAG, "First detection bbox: [$left, $top, $right, $bottom]")
-                    Log.d(TAG, "  Raw: xCenter=$xCenter, yCenter=$yCenter, w=$width, h=$height")
-                    Log.d(TAG, "  Image size: $originalWidth x $originalHeight")
-                }
-
                 detections.add(Detection(bbox, labels[bestClass], bestScore))
             }
         }
@@ -357,108 +315,128 @@ class MainActivity : AppCompatActivity(), View.OnClickListener {
         return intersectionArea / union
     }
 
-    private fun setViewAndDetect(bitmap: Bitmap) {
-        inputImageView.setImageBitmap(bitmap)
-        tvPlaceholder.visibility = View.INVISIBLE
-        lifecycleScope.launch(Dispatchers.Default) { runObjectDetection(bitmap) }
+    private fun ImageProxy.toBitmap(): Bitmap {
+        val buffer = planes[0].buffer
+        val bytes = ByteArray(buffer.remaining())
+        buffer.get(bytes)
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     }
 
-    // Camera and image handling (same as before)
-    private fun getCapturedImage(): Bitmap {
-        val targetW = inputImageView.width
-        val targetH = inputImageView.height
-        val bmOptions = BitmapFactory.Options().apply {
-            inJustDecodeBounds = true
-            BitmapFactory.decodeFile(currentPhotoPath, this)
-            val photoW = outWidth
-            val photoH = outHeight
-            val scaleFactor = max(1, min(photoW / targetW, photoH / targetH))
-            inJustDecodeBounds = false
-            inSampleSize = scaleFactor
-            inMutable = true
-        }
-        val exif = ExifInterface(currentPhotoPath)
-        val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_UNDEFINED)
-        val bitmap = BitmapFactory.decodeFile(currentPhotoPath, bmOptions)
-        return when (orientation) {
-            ExifInterface.ORIENTATION_ROTATE_90 -> rotateImage(bitmap, 90f)
-            ExifInterface.ORIENTATION_ROTATE_180 -> rotateImage(bitmap, 180f)
-            ExifInterface.ORIENTATION_ROTATE_270 -> rotateImage(bitmap, 270f)
-            else -> bitmap
-        }
+    private fun rotateBitmap(bitmap: Bitmap, degrees: Int): Bitmap {
+        if (degrees == 0) return bitmap
+        val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
 
-    private fun getSampleImage(drawable: Int): Bitmap =
-        BitmapFactory.decodeResource(resources, drawable, BitmapFactory.Options().apply { inMutable = true })
-
-    private fun rotateImage(source: Bitmap, angle: Float): Bitmap {
-        val matrix = Matrix()
-        matrix.postRotate(angle)
-        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
     }
 
-    @Throws(IOException::class)
-    private fun createImageFile(): File {
-        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val storageDir = getExternalFilesDir(Environment.DIRECTORY_PICTURES)
-        return File.createTempFile("JPEG_${timeStamp}_", ".jpg", storageDir).apply {
-            currentPhotoPath = absolutePath
-        }
-    }
-
-    private fun dispatchTakePictureIntent() {
-        Intent(MediaStore.ACTION_IMAGE_CAPTURE).also { intent ->
-            intent.resolveActivity(packageManager)?.also {
-                val photoFile = try { createImageFile() } catch (e: IOException) {
-                    Log.e(TAG, e.message.toString())
-                    Toast.makeText(this, "Failed to create image file", Toast.LENGTH_SHORT).show()
-                    null
-                }
-                photoFile?.also { file ->
-                    val uri = FileProvider.getUriForFile(this, "org.tensorflow.codelabs.objectdetection.fileprovider", file)
-                    intent.putExtra(MediaStore.EXTRA_OUTPUT, uri)
-                    startActivityForResult(intent, REQUEST_IMAGE_CAPTURE)
-                }
-            } ?: run {
-                Log.e(TAG, "No camera activity found")
-                Toast.makeText(this, "No camera app found", Toast.LENGTH_SHORT).show()
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CODE_PERMISSIONS) {
+            if (allPermissionsGranted()) {
+                tvStatus.text = "Ready. Tap Start Camera."
+            } else {
+                Toast.makeText(this, "Permissions not granted", Toast.LENGTH_SHORT).show()
+                finish()
             }
         }
     }
 
-    private fun drawDetectionResult(bitmap: Bitmap, results: List<DetectionResult>): Bitmap {
-        val output = bitmap.copy(Bitmap.Config.ARGB_8888, true)
-        val canvas = Canvas(output)
-        val paint = Paint().apply { textAlign = Paint.Align.LEFT }
-
-        for (r in results) {
-            // Draw bounding box
-            paint.color = Color.GREEN
-            paint.strokeWidth = 8f
-            paint.style = Paint.Style.STROKE
-            canvas.drawRect(r.boundingBox, paint)
-
-            // Draw text background
-            val bounds = Rect()
-            paint.style = Paint.Style.FILL
-            paint.color = Color.BLACK
-            paint.textSize = 48f
-            paint.getTextBounds(r.text, 0, r.text.length, bounds)
-            canvas.drawRect(
-                r.boundingBox.left,
-                r.boundingBox.top - bounds.height() - 10,
-                r.boundingBox.left + bounds.width() + 20,
-                r.boundingBox.top,
-                paint
-            )
-
-            // Draw text
-            paint.color = Color.WHITE
-            canvas.drawText(r.text, r.boundingBox.left + 10, r.boundingBox.top - 10, paint)
-        }
-        return output
+    override fun onDestroy() {
+        super.onDestroy()
+        cameraExecutor?.shutdown()
+        interpreter?.close()
     }
 }
 
-data class DetectionResult(val boundingBox: RectF, val text: String)
+/**
+ * Custom view for drawing detection overlays
+ */
+class OverlayView @JvmOverloads constructor(
+    context: android.content.Context,
+    attrs: android.util.AttributeSet? = null,
+    defStyleAttr: Int = 0
+) : View(context, attrs, defStyleAttr) {
+
+    private var detections = listOf<Detection>()
+    private var imageWidth = 0
+    private var imageHeight = 0
+
+    private val boxPaint = Paint().apply {
+        color = Color.GREEN
+        style = Paint.Style.STROKE
+        strokeWidth = 8f
+    }
+
+    private val textPaint = Paint().apply {
+        color = Color.WHITE
+        textSize = 48f
+        style = Paint.Style.FILL
+    }
+
+    private val backgroundPaint = Paint().apply {
+        color = Color.BLACK
+        alpha = 180
+        style = Paint.Style.FILL
+    }
+
+    fun setDetections(newDetections: List<Detection>, imgWidth: Int, imgHeight: Int) {
+        detections = newDetections
+        imageWidth = imgWidth
+        imageHeight = imgHeight
+        invalidate()
+    }
+
+    fun clear() {
+        detections = emptyList()
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+
+        if (detections.isEmpty() || imageWidth == 0 || imageHeight == 0) return
+
+        // Calculate scale factor to fit overlay on preview
+        val scaleX = width.toFloat() / imageWidth
+        val scaleY = height.toFloat() / imageHeight
+
+        detections.forEach { detection ->
+            // Scale bounding box to overlay coordinates
+            val box = RectF(
+                detection.bbox.left * scaleX,
+                detection.bbox.top * scaleY,
+                detection.bbox.right * scaleX,
+                detection.bbox.bottom * scaleY
+            )
+
+            // Draw bounding box
+            canvas.drawRect(box, boxPaint)
+
+            // Draw label
+            val text = "₹${detection.label} (${(detection.confidence * 100).toInt()}%)"
+            val textBounds = Rect()
+            textPaint.getTextBounds(text, 0, text.length, textBounds)
+
+            // Draw background for text
+            canvas.drawRect(
+                box.left,
+                box.top - textBounds.height() - 20,
+                box.left + textBounds.width() + 20,
+                box.top,
+                backgroundPaint
+            )
+
+            // Draw text
+            canvas.drawText(text, box.left + 10, box.top - 10, textPaint)
+        }
+    }
+}
+
 data class Detection(val bbox: RectF, val label: String, val confidence: Float)
