@@ -48,14 +48,33 @@
             android:gravity="center"
             android:layout_marginBottom="16dp" />
 
-        <!-- Start/Stop Button -->
-        <Button
-            android:id="@+id/btnToggleCamera"
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Start Camera"
-            android:textSize="18sp"
-            android:padding="16dp" />
+            android:orientation="horizontal"
+            android:weightSum="2">
+
+            <!-- Start/Stop Button -->
+            <Button
+                android:id="@+id/btnToggleCamera"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Start Camera"
+                android:textSize="14sp"
+                android:layout_marginEnd="8dp" />
+
+            <!-- Flashlight Button -->
+            <Button
+                android:id="@+id/btnToggleFlash"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Flash: Off"
+                android:textSize="14sp"
+                android:layout_marginStart="8dp" />
+
+        </LinearLayout>
 
     </LinearLayout>
 

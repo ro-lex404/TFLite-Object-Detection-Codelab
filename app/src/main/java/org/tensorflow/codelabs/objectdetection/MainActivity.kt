@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.graphics.*
 import android.os.Bundle
+import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.view.View
 import android.widget.Button
@@ -12,17 +13,20 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
+import androidx.camera.core.Camera
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.common.FileUtil
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.max
@@ -32,7 +36,7 @@ import kotlin.math.min
  * Real-time Currency Detection with CameraX
  * Detects Indian currency notes in real-time using the camera
  */
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     companion object {
         const val TAG = "CurrencyDetector"
         private const val REQUEST_CODE_PERMISSIONS = 10
@@ -41,23 +45,32 @@ class MainActivity : AppCompatActivity() {
         private const val NUM_CLASSES = 6
         private const val CONFIDENCE_THRESHOLD = 0.5f
         private const val IOU_THRESHOLD = 0.45f
+        private const val VOICE_DELAY_MS = 3000L
     }
 
     // UI Components
     private lateinit var previewView: PreviewView
     private lateinit var overlayView: OverlayView
     private lateinit var btnToggleCamera: Button
+    private lateinit var btnToggleFlash: Button
     private lateinit var tvStatus: TextView
 
     // Camera
+    private var camera: Camera? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var cameraExecutor: ExecutorService? = null
     private var imageAnalysis: ImageAnalysis? = null
     private var isCameraRunning = false
+    private var isFlashOn = false
 
     // Model
     private var interpreter: Interpreter? = null
     private val labels = listOf("10", "100", "20", "200", "50", "500")
+
+    // TTS
+    private var tts: TextToSpeech? = null
+    private var lastSpokenTotal = -1
+    private var isSpeaking = false
 
     // Detection state
     private var lastDetectionTime = 0L
@@ -71,6 +84,7 @@ class MainActivity : AppCompatActivity() {
         previewView = findViewById(R.id.previewView)
         overlayView = findViewById(R.id.overlayView)
         btnToggleCamera = findViewById(R.id.btnToggleCamera)
+        btnToggleFlash = findViewById(R.id.btnToggleFlash)
         tvStatus = findViewById(R.id.tvStatus)
 
         btnToggleCamera.setOnClickListener {
@@ -81,8 +95,15 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        btnToggleFlash.setOnClickListener {
+            toggleFlash()
+        }
+
         // Initialize camera executor
         cameraExecutor = Executors.newSingleThreadExecutor()
+
+        // Initialize TTS
+        tts = TextToSpeech(this, this)
 
         // Load model
         try {
@@ -107,6 +128,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            val result = tts?.setLanguage(Locale.US)
+            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                Log.e(TAG, "TTS: Language not supported")
+            }
+        } else {
+            Log.e(TAG, "TTS: Initialization failed")
+        }
+    }
+
     private fun startCamera() {
         if (!allPermissionsGranted()) {
             Toast.makeText(this, "Camera permission required", Toast.LENGTH_SHORT).show()
@@ -126,9 +158,23 @@ class MainActivity : AppCompatActivity() {
     private fun stopCamera() {
         cameraProvider?.unbindAll()
         isCameraRunning = false
+        isFlashOn = false
         btnToggleCamera.text = "Start Camera"
+        btnToggleFlash.text = "Flash: Off"
         tvStatus.text = "Camera stopped"
         overlayView.clear()
+        lastSpokenTotal = -1
+    }
+
+    private fun toggleFlash() {
+        if (!isCameraRunning) {
+            Toast.makeText(this, "Start camera first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        
+        isFlashOn = !isFlashOn
+        camera?.cameraControl?.enableTorch(isFlashOn)
+        btnToggleFlash.text = if (isFlashOn) "Flash: On" else "Flash: Off"
     }
 
     @SuppressLint("UnsafeOptInUsageError")
@@ -158,12 +204,16 @@ class MainActivity : AppCompatActivity() {
 
         try {
             cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(
+            camera = cameraProvider.bindToLifecycle(
                 this,
                 cameraSelector,
                 preview,
                 imageAnalysis
             )
+            
+            // Ensure flash state is maintained if camera rebinds
+            camera?.cameraControl?.enableTorch(isFlashOn)
+            
         } catch (e: Exception) {
             Log.e(TAG, "Camera binding failed", e)
         }
@@ -193,8 +243,13 @@ class MainActivity : AppCompatActivity() {
                 if (detections.isNotEmpty()) {
                     val total = detections.sumOf { it.label.toIntOrNull() ?: 0 }
                     tvStatus.text = "Detected: ${detections.size} note(s), Total: ₹$total"
+                    
+                    if (total > 0 && total != lastSpokenTotal && !isSpeaking) {
+                        speakTotal(total)
+                    }
                 } else {
                     tvStatus.text = "No currency detected"
+                    lastSpokenTotal = -1
                 }
             }
 
@@ -202,6 +257,22 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "Detection error", e)
         } finally {
             imageProxy.close()
+        }
+    }
+
+    private fun speakTotal(total: Int) {
+        lastSpokenTotal = total
+        isSpeaking = true
+        lifecycleScope.launch(Dispatchers.Main) {
+            delay(VOICE_DELAY_MS)
+            // Check if the camera is still running and the total is still the same or significant
+            if (isCameraRunning && lastSpokenTotal == total) {
+                val text = "Total amount is $total rupees"
+                tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, null)
+            }
+            // Add a small cooldown before allowing the next speech
+            delay(2000)
+            isSpeaking = false
         }
     }
 
@@ -352,6 +423,8 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         cameraExecutor?.shutdown()
         interpreter?.close()
+        tts?.stop()
+        tts?.shutdown()
     }
 }
 

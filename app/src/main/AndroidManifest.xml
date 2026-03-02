@@ -2,20 +2,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="org.tensorflow.codelabs.objectdetection">
 
-    <!-- Permissions for camera access -->
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+
     <uses-permission android:name="android.permission.CAMERA" />
-
-    <!-- Optional: For saving images to storage if needed -->
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28" />
-
-    <!-- Feature declaration: Camera is required -->
-    <uses-feature android:name="android.hardware.camera" android:required="true" />
-    <uses-feature android:name="android.hardware.camera.autofocus" />
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <queries>
         <intent>
-            <action android:name="android.media.action.IMAGE_CAPTURE" />
+            <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
     </queries>
 
@@ -28,7 +24,7 @@
         android:theme="@style/Theme.ObjectDetection">
 
         <activity
-            android:name=".MainActivity"
+            android:name=".HomeActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -36,15 +32,16 @@
             </intent-filter>
         </activity>
 
-        <provider
-            android:name="androidx.core.content.FileProvider"
-            android:authorities="${applicationId}.fileprovider"
-            android:exported="false"
-            android:grantUriPermissions="true">
-            <meta-data
-                android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/file_paths" />
-        </provider>
+        <activity
+            android:name=".MainActivity"
+            android:label="Currency Detection"
+            android:exported="false" />
+
+        <activity
+            android:name=".WeatherActivity"
+            android:label="Weather Info"
+            android:exported="false" />
+
     </application>
 
 </manifest>
